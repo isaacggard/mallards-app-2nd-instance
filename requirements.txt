@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+altair
+vaderSentiment
+openpyxl
+xlrd
+pyarrow
