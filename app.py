@@ -77,6 +77,13 @@ LEGACY_DATA_LIST_KEYS = {
     "survey_data": "survey_data",
     "unknown": "unknown_data",
 }
+DATASET_TYPE_ALIASES = {
+    "Transaction Data": "transaction_data",
+    "Ticket Data": "ticket_data",
+    "Survey Data": "survey_data",
+    "Unknown": "unknown",
+    "unknown_data": "unknown",
+}
 FAN_BEHAVIOR_METRIC_SCHEMA_VERSION = "fan_behavior_v6"
 TRANSACTION_METRIC_SCHEMA_VERSION = "transaction_v5"
 SURVEY_METRIC_SCHEMA_VERSION = "survey_v5"
@@ -339,11 +346,51 @@ def add_source_file_column(df: pd.DataFrame, file_name: str) -> pd.DataFrame:
     return df
 
 
+def normalize_dataset_type(dataset_type: Any) -> str:
+    if dataset_type is None:
+        return "unknown"
+    try:
+        if pd.isna(dataset_type):
+            return "unknown"
+    except (TypeError, ValueError):
+        pass
+
+    dataset_type_text = str(dataset_type).strip()
+    return DATASET_TYPE_ALIASES.get(dataset_type_text, dataset_type_text) or "unknown"
+
+
+def record_file_name(record: dict[str, Any]) -> str:
+    return (
+        record.get("file")
+        or record.get("File")
+        or record.get("name")
+        or "Uploaded file"
+    )
+
+
+def record_dataset_type(record: dict[str, Any]) -> str:
+    return normalize_dataset_type(
+        record.get("dataset_type")
+        or record.get("detected_type")
+        or record.get("Detected Type")
+        or "unknown"
+    )
+
+
+def record_int(record: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        if key in record:
+            return int(record.get(key) or 0)
+    return 0
+
+
 def loaded_file_count(dataset_type: str) -> int:
+    normalized_dataset_type = normalize_dataset_type(dataset_type)
     return sum(
         1
         for record in st.session_state.get("loaded_dataset_records", [])
-        if record.get("dataset_type") == dataset_type
+        if isinstance(record, dict)
+        and record_dataset_type(record) == normalized_dataset_type
     )
 
 
@@ -787,7 +834,11 @@ def migrate_legacy_session_storage() -> None:
             for index, frame in enumerate(st.session_state.get(list_key, []), 1):
                 records.append(
                     {
-                        "file": f"Existing {DATA_TYPE_LABELS[dataset_type]} {index}",
+                        "file": (
+                            f"Existing "
+                            f"{DATA_TYPE_LABELS.get(dataset_type, 'Unknown')} "
+                            f"{index}"
+                        ),
                         "dataset_type": dataset_type,
                         "data": frame,
                     }
@@ -799,8 +850,11 @@ def migrate_legacy_session_storage() -> None:
     }
 
     for record in records:
-        file_name = record.get("file", "Uploaded file")
-        dataset_type = record.get("dataset_type", "unknown")
+        if not isinstance(record, dict):
+            continue
+
+        file_name = record_file_name(record)
+        dataset_type = record_dataset_type(record)
         data = record.get("data")
 
         if isinstance(data, pd.DataFrame):
@@ -809,8 +863,8 @@ def migrate_legacy_session_storage() -> None:
             row_count = len(data)
             column_count = len(data.columns)
         else:
-            row_count = int(record.get("rows", 0))
-            column_count = int(record.get("columns", 0))
+            row_count = record_int(record, "rows", "Rows")
+            column_count = record_int(record, "columns", "Columns")
 
         normalized_records.append(
             {
@@ -833,7 +887,11 @@ def migrate_legacy_session_storage() -> None:
             )
 
     st.session_state.loaded_dataset_records = normalized_records
-    st.session_state.loaded_files = {record["file"] for record in normalized_records}
+    st.session_state.loaded_files = {
+        record_file_name(record)
+        for record in normalized_records
+        if isinstance(record, dict)
+    }
     for list_key in LEGACY_DATA_LIST_KEYS.values():
         st.session_state[list_key] = []
 
@@ -1054,7 +1112,7 @@ def add_loaded_dataset_record(
     st.session_state.loaded_dataset_records.append(
         {
             "file": file_name,
-            "dataset_type": dataset_type,
+            "dataset_type": normalize_dataset_type(dataset_type),
             "rows": row_count,
             "columns": column_count,
         }
@@ -1076,13 +1134,17 @@ def invalidate_metrics_for_dataset_type(dataset_type: str) -> None:
 def loaded_files_frame() -> pd.DataFrame:
     rows = []
     for record in st.session_state.loaded_dataset_records:
-        dataset_type = record["dataset_type"]
+        if not isinstance(record, dict):
+            continue
+
+        dataset_type = record_dataset_type(record)
+        file_name = record_file_name(record)
         rows.append(
             {
-                "File": record["file"],
+                "File": file_name,
                 "Detected Type": DATA_TYPE_LABELS.get(dataset_type, "Unknown"),
-                "Rows": record.get("rows", 0),
-                "Columns": record.get("columns", 0),
+                "Rows": record_int(record, "rows", "Rows"),
+                "Columns": record_int(record, "columns", "Columns"),
             }
         )
 
@@ -1091,17 +1153,30 @@ def loaded_files_frame() -> pd.DataFrame:
 
 def remove_loaded_file(file_name: str) -> None:
     records = st.session_state.loaded_dataset_records
-    removed_records = [record for record in records if record["file"] == file_name]
+    removed_records = [
+        record
+        for record in records
+        if isinstance(record, dict)
+        and record_file_name(record) == file_name
+    ]
     if not removed_records:
         st.session_state.message = "Select a loaded file to remove"
         return
 
-    removed_types = {record["dataset_type"] for record in removed_records}
+    removed_types = {
+        record_dataset_type(record)
+        for record in removed_records
+    }
     st.session_state.loaded_dataset_records = [
-        record for record in records if record["file"] != file_name
+        record
+        for record in records
+        if not isinstance(record, dict)
+        or record_file_name(record) != file_name
     ]
     st.session_state.loaded_files = {
-        record["file"] for record in st.session_state.loaded_dataset_records
+        record_file_name(record)
+        for record in st.session_state.loaded_dataset_records
+        if isinstance(record, dict)
     }
     remove_source_file_from_state(file_name)
 
@@ -1222,7 +1297,7 @@ def process_uploaded_files(uploaded_files: list[Any]) -> bool:
             )
             continue
 
-        detected_type = classify_dataset(loaded_data, file_name)
+        detected_type = normalize_dataset_type(classify_dataset(loaded_data, file_name))
         add_source_file_column(loaded_data, file_name)
         if detected_type == "transaction_data":
             invalidate_transaction_metrics()
@@ -1233,7 +1308,7 @@ def process_uploaded_files(uploaded_files: list[Any]) -> bool:
         elif detected_type == "survey_data":
             invalidate_survey_metrics()
 
-        loaded_dataframes_by_type[detected_type].append(loaded_data)
+        loaded_dataframes_by_type.setdefault(detected_type, []).append(loaded_data)
         add_loaded_dataset_record(
             file_name,
             detected_type,
@@ -1241,7 +1316,7 @@ def process_uploaded_files(uploaded_files: list[Any]) -> bool:
             len(loaded_data.columns),
         )
         loaded_any_file = True
-        detection_label = DATA_TYPE_LABELS[detected_type]
+        detection_label = DATA_TYPE_LABELS.get(detected_type, "Unknown")
         detection_rows.append(
             {
                 "file": file_name,
