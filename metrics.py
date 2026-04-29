@@ -1,5 +1,7 @@
+import inspect
 import re
 import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -39,17 +41,22 @@ def empty_chart(columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame(columns=columns)
 
 
+def cache_page_metrics(func: Callable) -> Callable:
+    cache_options = {"show_spinner": False, "max_entries": 1}
+    if "scope" in inspect.signature(st.cache_data).parameters:
+        cache_options["scope"] = "session"
+    return st.cache_data(**cache_options)(func)
+
+
 # =============================================================================
 # Transaction Insights Page Metrics
 # =============================================================================
 REQUIRED_TRANSACTION_COLUMNS = {
     "date": ["Date"],
-    "time": ["Time"],
     "net_sales": ["Net Sales"],
     "location": ["Location"],
     "device_name": ["Device Name"],
     "transaction_id": ["Transaction ID"],
-    "partial_refunds": ["Partial Refunds"],
 }
 TRANSACTION_METRIC_SCHEMA_VERSION = "transaction_v5"
 DAY_ORDER = [
@@ -244,7 +251,7 @@ def build_cumulative_revenue(df: pd.DataFrame) -> pd.DataFrame:
     return cumulative[["date", "cumulative_net_sales"]]
 
 
-@st.cache_data(show_spinner=False)
+@cache_page_metrics
 def prepare_transaction_insights_metrics(transaction_df: pd.DataFrame) -> dict:
     resolved_columns = {
         key: find_column(transaction_df, candidates)
@@ -257,11 +264,6 @@ def prepare_transaction_insights_metrics(transaction_df: pd.DataFrame) -> dict:
             "date_raw": (
                 transaction_df[resolved_columns["date"]]
                 if resolved_columns["date"]
-                else pd.Series(pd.NA, index=row_index)
-            ),
-            "time_raw": (
-                transaction_df[resolved_columns["time"]]
-                if resolved_columns["time"]
                 else pd.Series(pd.NA, index=row_index)
             ),
             "net_sales": (
@@ -284,18 +286,12 @@ def prepare_transaction_insights_metrics(transaction_df: pd.DataFrame) -> dict:
                 if resolved_columns["transaction_id"]
                 else pd.Series(pd.NA, index=row_index)
             ),
-            "partial_refunds": (
-                transaction_df[resolved_columns["partial_refunds"]]
-                if resolved_columns["partial_refunds"]
-                else pd.Series(0.0, index=row_index)
-            ),
         }
     )
 
     df["transaction_datetime"] = pd.to_datetime(df["date_raw"], errors="coerce")
     df["transaction_date"] = df["transaction_datetime"].dt.normalize()
     df["net_sales"] = to_numeric_preserve_index(df["net_sales"])
-    df["partial_refunds"] = to_numeric_preserve_index(df["partial_refunds"])
     df["location"] = (
         df["location"]
         .astype("string")
@@ -303,24 +299,7 @@ def prepare_transaction_insights_metrics(transaction_df: pd.DataFrame) -> dict:
         .str.strip()
         .replace("", "unknown")
     )
-    df["clean_device"] = clean_device_name(df["device_name"])
     df["stand_location"] = map_stand_location(df["device_name"])
-
-    time_text = df["time_raw"].astype("string")
-    time_24h = pd.to_datetime(time_text, format="%H:%M:%S", errors="coerce")
-    time_24h_short = pd.to_datetime(time_text, format="%H:%M", errors="coerce")
-    time_12h = pd.to_datetime(time_text, format="%I:%M:%S %p", errors="coerce")
-    df["hour"] = (
-        time_24h.dt.hour
-        .fillna(time_24h_short.dt.hour)
-        .fillna(time_12h.dt.hour)
-    )
-    numeric_time = pd.to_numeric(df["time_raw"], errors="coerce")
-    excel_hour = numeric_time.mul(24).floordiv(1).mod(24).where(
-        numeric_time.between(0, 1)
-    )
-    df["hour"] = df["hour"].fillna(excel_hour)
-    df["hour"] = df["hour"].fillna(df["transaction_datetime"].dt.hour)
 
     df["year"] = df["transaction_date"].dt.year
     df["weekday_number"] = df["transaction_date"].dt.dayofweek
@@ -555,7 +534,7 @@ def build_tenure_spend_by_bin(df: pd.DataFrame) -> pd.Series:
     )
 
 
-@st.cache_data(show_spinner=False)
+@cache_page_metrics
 def prepare_fan_behavior_metrics(full_fan_master: pd.DataFrame) -> dict:
     df = prepare_fan_metric_layer(full_fan_master)
     spend_per_game = (
@@ -1537,7 +1516,7 @@ def build_topic_text_summary(text_chart: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-@st.cache_data(show_spinner=False)
+@cache_page_metrics
 def prepare_survey_analysis_metrics(survey_frames_or_df) -> dict:
     survey_df = combine_survey_input(survey_frames_or_df)
     long_df = build_survey_long(survey_df)

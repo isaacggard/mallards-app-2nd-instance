@@ -1,4 +1,5 @@
 import re
+import sys
 import time
 from io import BytesIO
 from pathlib import Path
@@ -9,12 +10,72 @@ import streamlit as st
 
 
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xlsm", ".xls", ".parquet"}
+TRANSACTION_SOURCE_COLUMNS = [
+    "Date",
+    "Gross Sales",
+    "Discounts",
+    "Service Charges",
+    "Partial Refunds",
+    "Net Sales",
+    "Card",
+    "Cash",
+    "Square Gift Card",
+    "Other Tender",
+    "Fees",
+    "Total Collected",
+    "Net Total",
+    "Tax",
+    "Tip",
+    "Gift Card Sales",
+    "Cash App",
+    "Transaction ID",
+    "Device Name",
+    "Location",
+    "Customer Name",
+]
+TICKET_SOURCE_COLUMNS = [
+    "Row",
+    "Seat Number",
+    "Customer First",
+    "Customer Last",
+    "Customer Email",
+    "Game Date",
+    "Section",
+    "Customer Phone",
+    "Customer Company",
+    "Customer Address",
+    "Customer City",
+    "Customer State",
+    "Customer Zip Code",
+    "Account Number",
+    "Account Name",
+    "Opponent",
+    "Ticket Type",
+    "Package Name",
+    "Promo Name",
+    "Scanned?",
+    "Price",
+    "Total",
+]
 
 DATA_TYPE_LABELS = {
     "transaction_data": "Transaction Data",
     "ticket_data": "Ticket Data",
     "survey_data": "Survey Data",
     "unknown": "Unknown",
+}
+SOURCE_FILE_COLUMN = "_source_file"
+DATAFRAME_STATE_KEYS = {
+    "transaction_data": "transaction_df",
+    "ticket_data": "ticket_df",
+    "survey_data": "survey_df",
+    "unknown": "unknown_df",
+}
+LEGACY_DATA_LIST_KEYS = {
+    "transaction_data": "transaction_data",
+    "ticket_data": "ticket_data",
+    "survey_data": "survey_data",
+    "unknown": "unknown_data",
 }
 FAN_BEHAVIOR_METRIC_SCHEMA_VERSION = "fan_behavior_v6"
 TRANSACTION_METRIC_SCHEMA_VERSION = "transaction_v5"
@@ -73,6 +134,40 @@ def find_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
+def select_source_columns(
+    file_name: str,
+    source_columns: list[Any],
+) -> list[str] | None:
+    normalized_file_name = Path(file_name).name.lower()
+    if is_survey_file_name(normalized_file_name):
+        return None
+
+    normalized_lookup = {
+        normalize_column_name(column): column for column in source_columns
+    }
+    normalized_columns = set(normalized_lookup)
+
+    transaction_columns = {"transaction id", "square gift card", "gross sales"}
+    if transaction_columns.issubset(normalized_columns):
+        selected = [
+            normalized_lookup[normalize_column_name(column)]
+            for column in TRANSACTION_SOURCE_COLUMNS
+            if normalize_column_name(column) in normalized_lookup
+        ]
+        return selected or None
+
+    ticket_columns = {"row", "seat number", "ticket type"}
+    if ticket_columns.issubset(normalized_columns):
+        selected = [
+            normalized_lookup[normalize_column_name(column)]
+            for column in TICKET_SOURCE_COLUMNS
+            if normalize_column_name(column) in normalized_lookup
+        ]
+        return selected or None
+
+    return None
+
+
 def require_column(df: pd.DataFrame, column_name: str) -> str:
     column = find_column(df, [column_name])
     if not column:
@@ -95,16 +190,29 @@ def optional_series(
     return pd.Series(default, index=df.index)
 
 
-@st.cache_data(show_spinner=False)
-def read_dataset(file_name: str, file_bytes: bytes) -> pd.DataFrame:
+def file_source_to_buffer(file_source: Any) -> Any:
+    if isinstance(file_source, (bytes, bytearray, memoryview)):
+        return BytesIO(file_source)
+    if hasattr(file_source, "seek"):
+        file_source.seek(0)
+    return file_source
+
+
+def read_dataset(file_name: str, file_source: Any) -> pd.DataFrame:
     extension = Path(file_name).suffix.lower()
-    file_buffer = BytesIO(file_bytes)
+    file_buffer = file_source_to_buffer(file_source)
 
     if extension == ".csv":
-        return pd.read_csv(file_buffer, low_memory=False)
+        header = pd.read_csv(file_buffer, nrows=0).columns.tolist()
+        usecols = select_source_columns(file_name, header)
+        file_buffer = file_source_to_buffer(file_source)
+        return pd.read_csv(file_buffer, low_memory=False, usecols=usecols)
 
     if extension in {".xlsx", ".xlsm", ".xls"}:
-        return pd.read_excel(file_buffer, sheet_name=0)
+        excel_file = pd.ExcelFile(file_buffer)
+        header = excel_file.parse(sheet_name=0, nrows=0).columns.tolist()
+        usecols = select_source_columns(file_name, header)
+        return excel_file.parse(sheet_name=0, usecols=usecols)
 
     if extension == ".parquet":
         return pd.read_parquet(file_buffer)
@@ -171,10 +279,9 @@ def add_survey_metadata(
     return enriched_df
 
 
-@st.cache_data(show_spinner=False)
-def read_survey_dataset(file_name: str, file_bytes: bytes) -> pd.DataFrame:
+def read_survey_dataset(file_name: str, file_source: Any) -> pd.DataFrame:
     extension = Path(file_name).suffix.lower()
-    file_buffer = BytesIO(file_bytes)
+    file_buffer = file_source_to_buffer(file_source)
 
     if extension == ".csv":
         df = pd.read_csv(file_buffer, low_memory=False)
@@ -200,7 +307,7 @@ def read_survey_dataset(file_name: str, file_bytes: bytes) -> pd.DataFrame:
             return pd.concat(frames, ignore_index=True, sort=False)
         return pd.DataFrame()
 
-    return read_dataset(file_name, file_bytes)
+    return read_dataset(file_name, file_source)
 
 
 def classify_dataset(df: pd.DataFrame, file_name: str) -> str:
@@ -221,35 +328,56 @@ def classify_dataset(df: pd.DataFrame, file_name: str) -> str:
     return "unknown"
 
 
-def combine_dataframes(dataframes: list[pd.DataFrame]) -> pd.DataFrame:
-    if not dataframes:
-        return pd.DataFrame()
+def add_source_file_column(df: pd.DataFrame, file_name: str) -> pd.DataFrame:
+    if SOURCE_FILE_COLUMN in df.columns:
+        df[SOURCE_FILE_COLUMN] = (
+            df[SOURCE_FILE_COLUMN].astype("string").fillna(file_name)
+        )
+        return df
 
-    return pd.concat(dataframes, ignore_index=True)
-
-
-def find_survey_rating_column(df: pd.DataFrame) -> str | None:
-    rating_terms = ["rating", "rate", "rank your experience", "scale of 1", "score"]
-
-    for column in df.columns:
-        normalized = normalize_column_name(column)
-        if any(term in normalized for term in rating_terms):
-            return column
-
-    numeric_columns = df.select_dtypes(include=["number"]).columns
-    if len(numeric_columns):
-        return numeric_columns[0]
-
-    return None
+    df.insert(0, SOURCE_FILE_COLUMN, file_name)
+    return df
 
 
-def to_numeric_series(series: pd.Series) -> pd.Series:
-    cleaned_series = (
-        series.astype(str)
-        .str.replace(r"[^0-9.\-]", "", regex=True)
-        .replace("", pd.NA)
+def loaded_file_count(dataset_type: str) -> int:
+    return sum(
+        1
+        for record in st.session_state.get("loaded_dataset_records", [])
+        if record.get("dataset_type") == dataset_type
     )
-    return pd.to_numeric(cleaned_series, errors="coerce").dropna()
+
+
+def append_dataframes_to_state(
+    dataframes_by_type: dict[str, list[pd.DataFrame]],
+) -> None:
+    for dataset_type, frames in dataframes_by_type.items():
+        if not frames:
+            continue
+
+        state_key = DATAFRAME_STATE_KEYS.get(dataset_type)
+        if not state_key:
+            continue
+
+        existing_df = st.session_state.get(state_key, pd.DataFrame())
+        new_df = pd.concat(frames, ignore_index=True, sort=False)
+        if existing_df.empty:
+            st.session_state[state_key] = new_df
+        else:
+            st.session_state[state_key] = pd.concat(
+                [existing_df, new_df],
+                ignore_index=True,
+                sort=False,
+            )
+
+
+def remove_source_file_from_state(file_name: str) -> None:
+    for state_key in DATAFRAME_STATE_KEYS.values():
+        df = st.session_state.get(state_key, pd.DataFrame())
+        if df.empty or SOURCE_FILE_COLUMN not in df.columns:
+            continue
+        st.session_state[state_key] = df[
+            ~df[SOURCE_FILE_COLUMN].astype("string").eq(file_name)
+        ].reset_index(drop=True)
 
 
 def to_numeric_preserve_index(series: pd.Series) -> pd.Series:
@@ -271,15 +399,41 @@ def clean_text_series(series: pd.Series) -> pd.Series:
     )
 
 
-def most_common_value(series: pd.Series) -> Any:
-    cleaned = (
-        series.astype("string")
+def most_common_by_group(
+    df: pd.DataFrame,
+    group_column: str,
+    value_column: str,
+    output_column: str,
+) -> pd.DataFrame:
+    if value_column not in df.columns:
+        return pd.DataFrame(columns=[group_column, output_column])
+
+    values = df[[group_column, value_column]].dropna()
+    if values.empty:
+        return pd.DataFrame(columns=[group_column, output_column])
+
+    values[value_column] = (
+        values[value_column]
+        .astype("string")
         .str.strip()
         .replace({"": pd.NA, "nan": pd.NA, "none": pd.NA, "<na>": pd.NA})
-        .dropna()
     )
-    mode = cleaned.mode()
-    return mode.iloc[0] if not mode.empty else None
+    values = values.dropna(subset=[value_column])
+    if values.empty:
+        return pd.DataFrame(columns=[group_column, output_column])
+
+    counts = (
+        values.groupby([group_column, value_column], as_index=False, observed=True)
+        .size()
+        .sort_values(
+            [group_column, "size", value_column],
+            ascending=[True, False, True],
+        )
+    )
+    return (
+        counts.drop_duplicates(group_column)[[group_column, value_column]]
+        .rename(columns={value_column: output_column})
+    )
 
 
 def clean_email_series(series: pd.Series) -> pd.Series:
@@ -320,7 +474,6 @@ def split_merch_customer_name(customer_name: pd.Series) -> tuple[pd.Series, pd.S
     return merch_email, merch_name
 
 
-@st.cache_data(show_spinner=False)
 def normalize_ticket_data(df: pd.DataFrame) -> pd.DataFrame:
     first_column = require_column(df, "Customer First")
     last_column = require_column(df, "Customer Last")
@@ -369,7 +522,6 @@ def normalize_ticket_data(df: pd.DataFrame) -> pd.DataFrame:
     return normalized_df[normalized_df["fan_key"].notna()]
 
 
-@st.cache_data(show_spinner=False)
 def aggregate_ticket_fans(ticket_df: pd.DataFrame) -> pd.DataFrame:
     normalized_tickets = normalize_ticket_data(ticket_df)
     if normalized_tickets.empty:
@@ -396,21 +548,32 @@ def aggregate_ticket_fans(ticket_df: pd.DataFrame) -> pd.DataFrame:
             first_game=("game_date", "min"),
             last_game=("game_date", "max"),
             opponents_seen=("opponent", "first"),
-            most_common_section=("section", most_common_value),
-            ticket_type=("ticket_type", most_common_value),
             package=("package", "first"),
             promo=("promo", "first"),
             tickets_scanned=("scanned_flag", "sum"),
             t_name_key=("t_name_key", "first"),
         )
     )
+    section_mode = most_common_by_group(
+        normalized_tickets,
+        "fan_key",
+        "section",
+        "most_common_section",
+    )
+    ticket_type_mode = most_common_by_group(
+        normalized_tickets,
+        "fan_key",
+        "ticket_type",
+        "ticket_type",
+    )
+    fan_agg = fan_agg.merge(section_mode, on="fan_key", how="left")
+    fan_agg = fan_agg.merge(ticket_type_mode, on="fan_key", how="left")
     fan_agg["scan_rate"] = (
         fan_agg["tickets_scanned"] / fan_agg["total_tickets"]
     ).round(3)
     return fan_agg
 
 
-@st.cache_data(show_spinner=False)
 def normalize_transaction_data(df: pd.DataFrame) -> pd.DataFrame:
     customer_name_column = require_column(df, "Customer Name")
     date_column = require_column(df, "Date")
@@ -424,9 +587,6 @@ def normalize_transaction_data(df: pd.DataFrame) -> pd.DataFrame:
             "merch_join_name": merch_join_name,
             "date": pd.to_datetime(df[date_column], errors="coerce"),
         }
-    )
-    normalized_df["match_key"] = normalized_df["merch_email"].combine_first(
-        normalized_df["merch_join_name"]
     )
 
     money_columns = [
@@ -455,7 +615,6 @@ def normalize_transaction_data(df: pd.DataFrame) -> pd.DataFrame:
     return normalized_df
 
 
-@st.cache_data(show_spinner=False)
 def aggregate_merch_by_key(
     merch_df: pd.DataFrame,
     key_column: str,
@@ -487,23 +646,18 @@ def aggregate_merch_by_key(
         if column in merch_keyed.columns
     ]
 
-    merch_agg = merch_keyed.groupby(key_column, as_index=False)[money_columns].sum()
-    transaction_counts = (
-        merch_keyed.groupby(key_column, as_index=False)
-        .size()
-        .rename(columns={"size": "merch_total_transactions"})
+    agg_spec = {
+        column: (column, "sum")
+        for column in money_columns
+    }
+    agg_spec.update(
+        {
+            "merch_total_transactions": (key_column, "size"),
+            "merch_first_purchase": ("date", "min"),
+            "merch_last_purchase": ("date", "max"),
+        }
     )
-    merch_agg = merch_agg.merge(transaction_counts, on=key_column, how="left")
-
-    date_agg = (
-        merch_keyed.groupby(key_column)["date"]
-        .agg(
-            merch_first_purchase="min",
-            merch_last_purchase="max",
-        )
-        .reset_index()
-    )
-    merch_agg = merch_agg.merge(date_agg, on=key_column, how="left")
+    merch_agg = merch_keyed.groupby(key_column, as_index=False).agg(**agg_spec)
 
     rename_map = {
         column: f"merch_{column.lower().replace(' ', '_')}"
@@ -513,7 +667,6 @@ def aggregate_merch_by_key(
     return merch_agg.rename(columns=rename_map)
 
 
-@st.cache_data(show_spinner=True)
 def build_fan_master_dataframe(
     ticket_df: pd.DataFrame,
     transaction_df: pd.DataFrame,
@@ -589,75 +742,6 @@ def build_fan_master_dataframe(
     return fan_master
 
 
-@st.cache_data(show_spinner=False)
-def build_transaction_chart_data(df: pd.DataFrame) -> pd.DataFrame:
-    sales_column = find_column(
-        df,
-        ["Gross Sales", "Net Sales", "Total Collected", "Amount"],
-    )
-    if not sales_column:
-        return pd.DataFrame(columns=["sales_range", "count"])
-
-    sales = to_numeric_series(df[sales_column])
-    if sales.empty:
-        return pd.DataFrame(columns=["sales_range", "count"])
-
-    if sales.nunique() == 1:
-        label = f"{sales.iloc[0]:.2f}"
-        return pd.DataFrame({"sales_range": [label], "count": [len(sales)]})
-
-    bins = min(10, sales.nunique())
-    bucketed_sales = pd.cut(sales, bins=bins, include_lowest=True)
-    histogram = bucketed_sales.value_counts().sort_index().reset_index()
-    histogram.columns = ["sales_range", "count"]
-    histogram["sales_range"] = histogram["sales_range"].astype(str)
-    return histogram
-
-
-@st.cache_data(show_spinner=False)
-def build_ticket_chart_data(df: pd.DataFrame) -> pd.DataFrame:
-    count_column = find_column(df, ["Scanned?", "Ticket Type"])
-    if not count_column:
-        return pd.DataFrame(columns=["category", "count"])
-
-    counts = (
-        df[count_column]
-        .fillna("Missing")
-        .astype(str)
-        .value_counts()
-        .head(10)
-        .reset_index()
-    )
-    counts.columns = ["category", "count"]
-    return counts
-
-
-@st.cache_data(show_spinner=False)
-def build_survey_chart_data(df: pd.DataFrame) -> pd.DataFrame:
-    rating_column = find_survey_rating_column(df)
-    if not rating_column:
-        return pd.DataFrame(columns=["rating", "count"])
-
-    numeric_ratings = to_numeric_series(df[rating_column])
-    if not numeric_ratings.empty:
-        ratings = numeric_ratings.round().astype(int).value_counts().sort_index()
-        return ratings.reset_index(name="count").rename(
-            columns={rating_column: "rating", "index": "rating"}
-        )
-
-    counts = (
-        df[rating_column]
-        .fillna("Missing")
-        .astype(str)
-        .value_counts()
-        .head(10)
-        .reset_index()
-    )
-    counts.columns = ["rating", "count"]
-    return counts
-
-
-@st.cache_data(show_spinner=False)
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
@@ -696,6 +780,64 @@ def ensure_metric_state_initialized() -> None:
         st.session_state.metrics_dirty.setdefault(key, value)
 
 
+def migrate_legacy_session_storage() -> None:
+    records = st.session_state.get("loaded_dataset_records", [])
+    if not records:
+        for dataset_type, list_key in LEGACY_DATA_LIST_KEYS.items():
+            for index, frame in enumerate(st.session_state.get(list_key, []), 1):
+                records.append(
+                    {
+                        "file": f"Existing {DATA_TYPE_LABELS[dataset_type]} {index}",
+                        "dataset_type": dataset_type,
+                        "data": frame,
+                    }
+                )
+
+    normalized_records = []
+    legacy_frames_by_type = {
+        dataset_type: [] for dataset_type in DATAFRAME_STATE_KEYS
+    }
+
+    for record in records:
+        file_name = record.get("file", "Uploaded file")
+        dataset_type = record.get("dataset_type", "unknown")
+        data = record.get("data")
+
+        if isinstance(data, pd.DataFrame):
+            add_source_file_column(data, file_name)
+            legacy_frames_by_type.setdefault(dataset_type, []).append(data)
+            row_count = len(data)
+            column_count = len(data.columns)
+        else:
+            row_count = int(record.get("rows", 0))
+            column_count = int(record.get("columns", 0))
+
+        normalized_records.append(
+            {
+                "file": file_name,
+                "dataset_type": dataset_type,
+                "rows": row_count,
+                "columns": column_count,
+            }
+        )
+
+    for dataset_type, frames in legacy_frames_by_type.items():
+        state_key = DATAFRAME_STATE_KEYS.get(dataset_type)
+        if not state_key or not frames:
+            continue
+        if st.session_state.get(state_key, pd.DataFrame()).empty:
+            st.session_state[state_key] = pd.concat(
+                frames,
+                ignore_index=True,
+                sort=False,
+            )
+
+    st.session_state.loaded_dataset_records = normalized_records
+    st.session_state.loaded_files = {record["file"] for record in normalized_records}
+    for list_key in LEGACY_DATA_LIST_KEYS.values():
+        st.session_state[list_key] = []
+
+
 def initialize_session_state() -> None:
     if "transaction_data" not in st.session_state:
         st.session_state.transaction_data = []
@@ -709,24 +851,12 @@ def initialize_session_state() -> None:
         st.session_state.loaded_files = set()
     if "last_upload_batch" not in st.session_state:
         st.session_state.last_upload_batch = tuple()
+    if "upload_widget_version" not in st.session_state:
+        st.session_state.upload_widget_version = 0
     if "detected_files" not in st.session_state:
         st.session_state.detected_files = empty_detection_frame()
     if "loaded_dataset_records" not in st.session_state:
         st.session_state.loaded_dataset_records = []
-        for data_key, dataset_type in [
-            ("transaction_data", "transaction_data"),
-            ("ticket_data", "ticket_data"),
-            ("survey_data", "survey_data"),
-            ("unknown_data", "unknown"),
-        ]:
-            for index, frame in enumerate(st.session_state.get(data_key, []), 1):
-                st.session_state.loaded_dataset_records.append(
-                    {
-                        "file": f"Existing {DATA_TYPE_LABELS[dataset_type]} {index}",
-                        "dataset_type": dataset_type,
-                        "data": frame,
-                    }
-                )
 
     if "transaction_df" not in st.session_state:
         st.session_state.transaction_df = pd.DataFrame()
@@ -737,18 +867,7 @@ def initialize_session_state() -> None:
     if "unknown_df" not in st.session_state:
         st.session_state.unknown_df = pd.DataFrame()
 
-    if "transaction_chart_data" not in st.session_state:
-        st.session_state.transaction_chart_data = pd.DataFrame(
-            columns=["sales_range", "count"]
-        )
-    if "ticket_chart_data" not in st.session_state:
-        st.session_state.ticket_chart_data = pd.DataFrame(
-            columns=["category", "count"]
-        )
-    if "survey_chart_data" not in st.session_state:
-        st.session_state.survey_chart_data = pd.DataFrame(
-            columns=["rating", "count"]
-        )
+    migrate_legacy_session_storage()
 
     if "message" not in st.session_state:
         st.session_state.message = "Please upload one or more files"
@@ -772,6 +891,19 @@ def invalidate_all_metrics() -> None:
     st.session_state.survey_metrics = None
     st.session_state.ticket_metrics = None
     st.session_state.metrics_dirty = default_metrics_dirty()
+    clear_metric_cache("prepare_fan_behavior_metrics")
+    clear_metric_cache("prepare_transaction_insights_metrics")
+    clear_metric_cache("prepare_survey_analysis_metrics")
+
+
+def clear_metric_cache(function_name: str) -> None:
+    metrics_module = sys.modules.get("metrics")
+    if metrics_module is None:
+        return
+
+    cached_function = getattr(metrics_module, function_name, None)
+    if hasattr(cached_function, "clear"):
+        cached_function.clear()
 
 
 def invalidate_transaction_metrics() -> None:
@@ -780,6 +912,8 @@ def invalidate_transaction_metrics() -> None:
     st.session_state.fan_behavior_metrics = None
     st.session_state.metrics_dirty["transaction"] = True
     st.session_state.metrics_dirty["fan_behavior"] = True
+    clear_metric_cache("prepare_transaction_insights_metrics")
+    clear_metric_cache("prepare_fan_behavior_metrics")
 
 
 def invalidate_ticket_metrics() -> None:
@@ -788,18 +922,21 @@ def invalidate_ticket_metrics() -> None:
     st.session_state.fan_behavior_metrics = None
     st.session_state.metrics_dirty["ticket"] = True
     st.session_state.metrics_dirty["fan_behavior"] = True
+    clear_metric_cache("prepare_fan_behavior_metrics")
 
 
 def invalidate_survey_metrics() -> None:
     ensure_metric_state_initialized()
     st.session_state.survey_metrics = None
     st.session_state.metrics_dirty["survey"] = True
+    clear_metric_cache("prepare_survey_analysis_metrics")
 
 
 def invalidate_fan_behavior_metrics() -> None:
     ensure_metric_state_initialized()
     st.session_state.fan_behavior_metrics = None
     st.session_state.metrics_dirty["fan_behavior"] = True
+    clear_metric_cache("prepare_fan_behavior_metrics")
 
 
 def ensure_transaction_metrics() -> dict:
@@ -887,7 +1024,7 @@ def ensure_ticket_metrics() -> dict:
         st.session_state.ticket_metrics = {
             "kpis": {
                 "ticket_rows": len(st.session_state.ticket_df),
-                "ticket_files": len(st.session_state.ticket_data),
+                "ticket_files": loaded_file_count("ticket_data"),
             },
             "charts": {},
             "metadata": {
@@ -908,61 +1045,18 @@ def reset_fan_master_state(status_message: str) -> None:
     invalidate_fan_behavior_metrics()
 
 
-def rebuild_combined_dataframes() -> None:
-    st.session_state.transaction_df = combine_dataframes(
-        st.session_state.transaction_data
-    )
-    st.session_state.ticket_df = combine_dataframes(st.session_state.ticket_data)
-    st.session_state.survey_df = combine_dataframes(st.session_state.survey_data)
-    st.session_state.unknown_df = combine_dataframes(st.session_state.unknown_data)
-
-    st.session_state.transaction_chart_data = build_transaction_chart_data(
-        st.session_state.transaction_df
-    )
-    st.session_state.ticket_chart_data = build_ticket_chart_data(
-        st.session_state.ticket_df
-    )
-    st.session_state.survey_chart_data = build_survey_chart_data(
-        st.session_state.survey_df
-    )
-
-
-def rebuild_data_from_loaded_records() -> None:
-    records = st.session_state.loaded_dataset_records
-    st.session_state.transaction_data = [
-        record["data"]
-        for record in records
-        if record["dataset_type"] == "transaction_data"
-    ]
-    st.session_state.ticket_data = [
-        record["data"]
-        for record in records
-        if record["dataset_type"] == "ticket_data"
-    ]
-    st.session_state.survey_data = [
-        record["data"]
-        for record in records
-        if record["dataset_type"] == "survey_data"
-    ]
-    st.session_state.unknown_data = [
-        record["data"]
-        for record in records
-        if record["dataset_type"] == "unknown"
-    ]
-    st.session_state.loaded_files = {record["file"] for record in records}
-    rebuild_combined_dataframes()
-
-
 def add_loaded_dataset_record(
     file_name: str,
     dataset_type: str,
-    data: pd.DataFrame,
+    row_count: int,
+    column_count: int,
 ) -> None:
     st.session_state.loaded_dataset_records.append(
         {
             "file": file_name,
             "dataset_type": dataset_type,
-            "data": data,
+            "rows": row_count,
+            "columns": column_count,
         }
     )
     st.session_state.loaded_files.add(file_name)
@@ -982,14 +1076,13 @@ def invalidate_metrics_for_dataset_type(dataset_type: str) -> None:
 def loaded_files_frame() -> pd.DataFrame:
     rows = []
     for record in st.session_state.loaded_dataset_records:
-        data = record["data"]
         dataset_type = record["dataset_type"]
         rows.append(
             {
                 "File": record["file"],
                 "Detected Type": DATA_TYPE_LABELS.get(dataset_type, "Unknown"),
-                "Rows": len(data),
-                "Columns": len(data.columns),
+                "Rows": record.get("rows", 0),
+                "Columns": record.get("columns", 0),
             }
         )
 
@@ -1007,7 +1100,10 @@ def remove_loaded_file(file_name: str) -> None:
     st.session_state.loaded_dataset_records = [
         record for record in records if record["file"] != file_name
     ]
-    rebuild_data_from_loaded_records()
+    st.session_state.loaded_files = {
+        record["file"] for record in st.session_state.loaded_dataset_records
+    }
+    remove_source_file_from_state(file_name)
 
     for dataset_type in removed_types:
         invalidate_metrics_for_dataset_type(dataset_type)
@@ -1042,12 +1138,15 @@ def append_detection_rows(rows: list[dict[str, str]]) -> None:
     )
 
 
-def process_uploaded_files(uploaded_files: list[Any]) -> None:
+def process_uploaded_files(uploaded_files: list[Any]) -> bool:
     if not uploaded_files:
         st.session_state.message = "Please upload one or more files"
-        return
+        return False
 
     detection_rows = []
+    loaded_dataframes_by_type = {
+        dataset_type: [] for dataset_type in DATAFRAME_STATE_KEYS
+    }
     loaded_any_file = False
     duplicate_found = False
     fan_master_input_changed = False
@@ -1077,8 +1176,8 @@ def process_uploaded_files(uploaded_files: list[Any]) -> None:
             )
             continue
 
-        file_bytes = uploaded_file.getvalue()
-        if not file_bytes:
+        file_size = getattr(uploaded_file, "size", None)
+        if file_size is not None and file_size == 0:
             detection_rows.append(
                 {
                     "file": file_name,
@@ -1090,9 +1189,9 @@ def process_uploaded_files(uploaded_files: list[Any]) -> None:
 
         try:
             if is_survey_file_name(file_name):
-                loaded_data = read_survey_dataset(file_name, file_bytes)
+                loaded_data = read_survey_dataset(file_name, uploaded_file)
             else:
-                loaded_data = read_dataset(file_name, file_bytes)
+                loaded_data = read_dataset(file_name, uploaded_file)
         except pd.errors.EmptyDataError:
             detection_rows.append(
                 {
@@ -1124,6 +1223,7 @@ def process_uploaded_files(uploaded_files: list[Any]) -> None:
             continue
 
         detected_type = classify_dataset(loaded_data, file_name)
+        add_source_file_column(loaded_data, file_name)
         if detected_type == "transaction_data":
             invalidate_transaction_metrics()
             fan_master_input_changed = True
@@ -1133,7 +1233,13 @@ def process_uploaded_files(uploaded_files: list[Any]) -> None:
         elif detected_type == "survey_data":
             invalidate_survey_metrics()
 
-        add_loaded_dataset_record(file_name, detected_type, loaded_data)
+        loaded_dataframes_by_type[detected_type].append(loaded_data)
+        add_loaded_dataset_record(
+            file_name,
+            detected_type,
+            len(loaded_data),
+            len(loaded_data.columns),
+        )
         loaded_any_file = True
         detection_label = DATA_TYPE_LABELS[detected_type]
         detection_rows.append(
@@ -1148,7 +1254,7 @@ def process_uploaded_files(uploaded_files: list[Any]) -> None:
     append_detection_rows(detection_rows)
 
     if loaded_any_file:
-        rebuild_data_from_loaded_records()
+        append_dataframes_to_state(loaded_dataframes_by_type)
         if fan_master_input_changed:
             reset_fan_master_state(
                 "New data loaded. Build the dashboard to refresh results"
@@ -1158,6 +1264,8 @@ def process_uploaded_files(uploaded_files: list[Any]) -> None:
         st.session_state.message = "Duplicate uploads ignored"
     else:
         st.session_state.message = "No valid datasets were loaded"
+
+    return True
 
 
 def build_fan_master_from_session() -> None:
@@ -1198,7 +1306,7 @@ def render_upload_section() -> None:
         "Upload datasets",
         type=["csv", "xlsx", "xlsm", "xls", "parquet"],
         accept_multiple_files=True,
-        key="dataset_uploader",
+        key=f"dataset_uploader_{st.session_state.upload_widget_version}",
     )
     uploaded_files = uploaded_files or []
 
@@ -1208,8 +1316,11 @@ def render_upload_section() -> None:
             for uploaded_file in uploaded_files
         )
         if current_upload_batch != st.session_state.last_upload_batch:
-            process_uploaded_files(uploaded_files)
-            st.session_state.last_upload_batch = current_upload_batch
+            processed = process_uploaded_files(uploaded_files)
+            if processed:
+                st.session_state.last_upload_batch = tuple()
+                st.session_state.upload_widget_version += 1
+                st.rerun()
     else:
         st.session_state.last_upload_batch = tuple()
         if not st.session_state.loaded_files:
@@ -1259,12 +1370,20 @@ def render_summary_section() -> None:
     summary_items = [
         (
             "Transaction",
-            len(st.session_state.transaction_data),
+            loaded_file_count("transaction_data"),
             len(st.session_state.transaction_df),
         ),
-        ("Ticket", len(st.session_state.ticket_data), len(st.session_state.ticket_df)),
-        ("Survey", len(st.session_state.survey_data), len(st.session_state.survey_df)),
-        ("Unknown", len(st.session_state.unknown_data), len(st.session_state.unknown_df)),
+        (
+            "Ticket",
+            loaded_file_count("ticket_data"),
+            len(st.session_state.ticket_df),
+        ),
+        (
+            "Survey",
+            loaded_file_count("survey_data"),
+            len(st.session_state.survey_df),
+        ),
+        ("Unknown", loaded_file_count("unknown"), len(st.session_state.unknown_df)),
     ]
     columns = st.columns(4)
     for column, (label, file_count, row_count) in zip(columns, summary_items):

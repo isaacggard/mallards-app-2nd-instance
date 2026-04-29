@@ -1,0 +1,16 @@
+__pycache__/
+.streamlit/secrets.toml
+
+# Local data exports should not be deployed to Streamlit Community Cloud.
+all_data/
+all_tickets_data/
+transaction_data/
+post_game_surveys/
+post_season_surveys/
+outputs/
+*.csv
+*.xlsx
+*.xlsm
+*.xls
+*.parquet
+
