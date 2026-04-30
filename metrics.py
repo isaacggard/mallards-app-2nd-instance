@@ -407,7 +407,6 @@ def prepare_fan_metric_layer(full_fan_master: pd.DataFrame) -> pd.DataFrame:
     working_df["first_game"] = pd.to_datetime(working_df["first_game"], errors="coerce")
     working_df["last_game"] = pd.to_datetime(working_df["last_game"], errors="coerce")
     working_df["total_spend"] = (working_df["merch_net_total"] + working_df["total_ticket_paid"])
-    working_df["total_spend_per_ticket"] = (working_df["merch_net_total"] + working_df["total_ticket_paid"]) / working_df["total_tickets"]
     working_df["tenure_days"] = (working_df["last_game"] - working_df["first_game"]).dt.days
     working_df["tenure_days"] = working_df["tenure_days"].fillna(0.0)
     working_df["section_group"] = build_section_group(working_df["most_common_section"])
@@ -440,7 +439,7 @@ def build_section_group(section_series: pd.Series) -> pd.Series:
 
 
 def build_fan_spend_distribution(df: pd.DataFrame) -> pd.Series:
-    spend = df.loc[df["total_spend_per_ticket"].ge(0), "total_spend"].dropna()
+    spend = df.loc[df["total_spend"].ge(0), "total_spend"].dropna()
     if spend.empty:
         return pd.Series(dtype="int64")
 
