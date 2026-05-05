@@ -1,7 +1,10 @@
+from importlib import reload
+
 import app
 from pages.fan_master_filters import install_fan_master_filters
 
 
+app = reload(app)
 install_fan_master_filters(app)
 app.initialize_session_state()
 app.render_dashboard_page()

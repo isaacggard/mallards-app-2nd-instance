@@ -149,37 +149,21 @@ def build_ticket_spend_distribution(df: pd.DataFrame) -> pd.Series:
     ).rename("fan_count")
 
 
-def build_tenure_spend_by_bin(df: pd.DataFrame) -> pd.Series:
-    tenure_df = df[["tenure_days", "total_spend", "total_tickets"]].dropna().copy()
-    if tenure_df.empty:
-        return pd.Series(dtype="float64")
-
-    bins = [-0.1, 30, 90, 180, 365, 730, np.inf]
-    labels = [
-        "0-30 Days",
-        "31-90 Days",
-        "91-180 Days",
-        "181-365 Days",
-        "1-2 Years",
-        "2+ Years",
-    ]
-    tenure_df["tenure_bin"] = pd.cut(tenure_df["tenure_days"], bins=bins, labels=labels)
-    return weighted_spend_by_group(tenure_df, "tenure_bin")
-
-
 def build_ticket_sales_by_day_of_week(df: pd.DataFrame) -> pd.Series:
-    single_game = df[
-        df["ticket_type_clean"].eq("single") & df["first_game"].notna()
+    one_game_fans = df[
+        df["first_game"].notna()
+        & df["last_game"].notna()
+        & df["first_game"].dt.normalize().eq(df["last_game"].dt.normalize())
     ].copy()
-    if single_game.empty:
+    if one_game_fans.empty:
         return pd.Series(dtype="float64")
 
-    single_game["weekday_number"] = single_game["first_game"].dt.dayofweek
-    single_game["day_of_week"] = single_game["weekday_number"].map(
+    one_game_fans["weekday_number"] = one_game_fans["first_game"].dt.dayofweek
+    one_game_fans["day_of_week"] = one_game_fans["weekday_number"].map(
         {index: day for index, day in enumerate(DAY_ORDER)}
     )
     return (
-        single_game.groupby(["weekday_number", "day_of_week"], observed=True)[
+        one_game_fans.groupby(["weekday_number", "day_of_week"], observed=True)[
             "total_tickets"
         ]
         .sum()
@@ -193,7 +177,11 @@ def build_games_attended_distribution(df: pd.DataFrame) -> pd.Series:
     games = df.loc[df["games_attended"].gt(0), "games_attended"].round().astype("int64")
     if games.empty:
         return pd.Series(dtype="int64")
-    return games.value_counts(sort=False).sort_index().rename("fan_count")
+    bins = [0, 1, 2, 3, 9, np.inf]
+    labels = ["1", "2", "3", "4-9", "10+"]
+    return pd.cut(games, bins=bins, labels=labels).value_counts(
+        sort=False,
+    ).rename("fan_count")
 
 
 @st.cache_data(show_spinner=False, max_entries=1)
@@ -225,11 +213,6 @@ def prepare_fan_intelligence_metrics(full_fan_master: pd.DataFrame) -> dict:
                 .dropna()
                 .rename("merch_conversion_rate")
             ),
-            "average_spend_by_merch_buyer": weighted_spend_by_group(
-                df,
-                "is_merch_buyer",
-            ).rename(index={0.0: "Non-Buyer", 1.0: "Buyer"}),
-            "tenure_spend_by_bin": build_tenure_spend_by_bin(df),
             "ticket_sales_by_day_of_week": build_ticket_sales_by_day_of_week(df),
             "games_attended_distribution": build_games_attended_distribution(df),
         },
