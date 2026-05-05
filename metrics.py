@@ -1,7 +1,5 @@
-import inspect
 import re
 import time
-from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -41,11 +39,10 @@ def empty_chart(columns: list[str]) -> pd.DataFrame:
     return pd.DataFrame(columns=columns)
 
 
-def cache_page_metrics(func: Callable) -> Callable:
-    cache_options = {"show_spinner": False, "max_entries": 1}
-    if "scope" in inspect.signature(st.cache_data).parameters:
-        cache_options["scope"] = "session"
-    return st.cache_data(**cache_options)(func)
+def cache_page_metrics(func):
+    # Page metrics are retained in session_state; adding st.cache_data here keeps
+    # an additional serialized copy of every metrics payload.
+    return func
 
 
 # =============================================================================
@@ -58,7 +55,7 @@ REQUIRED_TRANSACTION_COLUMNS = {
     "device_name": ["Device Name"],
     "transaction_id": ["Transaction ID"],
 }
-TRANSACTION_METRIC_SCHEMA_VERSION = "transaction_v5"
+TRANSACTION_METRIC_SCHEMA_VERSION = "transaction_v9"
 DAY_ORDER = [
     "Monday",
     "Tuesday",
@@ -76,6 +73,7 @@ STAND_LOCATION_ORDER = [
     "TDS Concessions",
     "Merchandise Store",
     "Sweet Treats",
+    "Other",
 ]
 
 
@@ -154,12 +152,17 @@ def build_yearly_revenue(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_stand_revenue(df: pd.DataFrame) -> pd.DataFrame:
+    stand_df = df.assign(stand_location=df["stand_location"].fillna("Other"))
     stand_revenue = (
-        df.dropna(subset=["stand_location"])
-        .groupby("stand_location", as_index=False, observed=True)["net_sales"]
+        stand_df.groupby("stand_location", as_index=False, observed=True)["net_sales"]
         .sum()
     )
-    stand_revenue = stand_revenue.sort_values("net_sales", ascending=False)
+    stand_revenue["stand_location"] = pd.Categorical(
+        stand_revenue["stand_location"],
+        categories=STAND_LOCATION_ORDER,
+        ordered=True,
+    )
+    stand_revenue = stand_revenue.sort_values("stand_location")
     return (
         stand_revenue
         if not stand_revenue.empty
@@ -172,8 +175,16 @@ def build_transaction_size_distribution(df: pd.DataFrame) -> pd.DataFrame:
     if sales.empty:
         return empty_chart(["sales_range", "count"])
 
-    bin_edges = [0, 25, 50, 75, 100, 200, np.inf]
-    labels = ["$0-$25", "$25-$50", "$50-$75", "$75-$100", "$100-$200", "$200+"]
+    bin_edges = [0, 10, 20, 30, 40, 50, 100, np.inf]
+    labels = [
+        "$0-$10",
+        "$10-$20",
+        "$20-$30",
+        "$30-$40",
+        "$40-$50",
+        "$50-$100",
+        "$100+",
+    ]
     sales_bins = pd.cut(
         sales,
         bins=bin_edges,
@@ -207,8 +218,9 @@ def build_revenue_by_day_of_week(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_device_efficiency(df: pd.DataFrame) -> pd.DataFrame:
+    stand_df = df.assign(stand_location=df["stand_location"].fillna("Other"))
     device_efficiency = (
-        df.dropna(subset=["stand_location"])
+        stand_df
         .groupby("stand_location", as_index=False, observed=True)
         .agg(
             avg_transaction_value=("net_sales", "mean"),
@@ -221,11 +233,8 @@ def build_device_efficiency(df: pd.DataFrame) -> pd.DataFrame:
         categories=STAND_LOCATION_ORDER,
         ordered=True,
     )
-    device_efficiency = (
-        device_efficiency.sort_values(
-            "avg_transaction_value",
-            ascending=False,
-        ).drop(columns=["total_revenue"])
+    device_efficiency = device_efficiency.sort_values("stand_location").drop(
+        columns=["total_revenue"]
     )
     return (
         device_efficiency
@@ -249,6 +258,44 @@ def build_cumulative_revenue(df: pd.DataFrame) -> pd.DataFrame:
 
     cumulative["cumulative_net_sales"] = cumulative["net_sales"].cumsum()
     return cumulative[["date", "cumulative_net_sales"]]
+
+
+def build_daily_transaction_summary(df: pd.DataFrame) -> pd.DataFrame:
+    daily = (
+        df.dropna(subset=["transaction_date", "year"])
+        .groupby(["transaction_date", "year"], as_index=False, observed=True)
+        .agg(
+            net_sales=("net_sales", "sum"),
+            transaction_count=("transaction_count_unit", "sum"),
+        )
+    )
+    daily = daily[
+        daily["net_sales"].gt(0) & daily["transaction_count"].gt(0)
+    ].copy()
+    if daily.empty:
+        return empty_chart(["date", "year", "net_sales", "transaction_count"])
+    return daily.rename(columns={"transaction_date": "date"})
+
+
+def build_transaction_trend_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    daily = build_daily_transaction_summary(df)
+    if daily.empty:
+        return empty_chart(["date", "year", "transaction_count"])
+
+    daily = daily[daily["transaction_count"].gt(200)].copy()
+    if daily.empty:
+        return empty_chart(["date", "year", "transaction_count"])
+    return daily[["date", "year", "transaction_count"]].sort_values("date")
+
+
+def build_daily_revenue_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    daily = build_daily_transaction_summary(df)
+    if daily.empty:
+        return empty_chart(["date", "year", "net_sales"])
+    daily = daily[daily["net_sales"].gt(5000)].copy()
+    if daily.empty:
+        return empty_chart(["date", "year", "net_sales"])
+    return daily[["date", "year", "net_sales"]].sort_values("date")
 
 
 @cache_page_metrics
@@ -292,6 +339,11 @@ def prepare_transaction_insights_metrics(transaction_df: pd.DataFrame) -> dict:
     df["transaction_datetime"] = pd.to_datetime(df["date_raw"], errors="coerce")
     df["transaction_date"] = df["transaction_datetime"].dt.normalize()
     df["net_sales"] = to_numeric_preserve_index(df["net_sales"])
+    df["transaction_count_unit"] = (
+        df["transaction_id"].notna().astype(int)
+        if resolved_columns["transaction_id"]
+        else 1
+    )
     df["location"] = (
         df["location"]
         .astype("string")
@@ -312,7 +364,7 @@ def prepare_transaction_insights_metrics(transaction_df: pd.DataFrame) -> dict:
     avg_transaction_value = float(df["net_sales"].mean()) if len(df) else 0.0
     active_days = int(df["transaction_date"].nunique())
     transaction_count = (
-        int(df["transaction_id"].notna().sum())
+        int(df["transaction_count_unit"].sum())
         if resolved_columns["transaction_id"]
         else len(df)
     )
@@ -351,6 +403,8 @@ def prepare_transaction_insights_metrics(transaction_df: pd.DataFrame) -> dict:
             "revenue_by_day_of_week": build_revenue_by_day_of_week(df),
             "device_efficiency": build_device_efficiency(df),
             "cumulative_revenue": build_cumulative_revenue(df),
+            "transaction_trend_analysis": build_transaction_trend_analysis(df),
+            "daily_revenue_analysis": build_daily_revenue_analysis(df),
         },
         "metadata": {
             "built_at": time.time(),
@@ -406,7 +460,9 @@ def prepare_fan_metric_layer(full_fan_master: pd.DataFrame) -> pd.DataFrame:
         ).fillna(0.0)
     working_df["first_game"] = pd.to_datetime(working_df["first_game"], errors="coerce")
     working_df["last_game"] = pd.to_datetime(working_df["last_game"], errors="coerce")
-    working_df["total_spend"] = (working_df["merch_net_total"] + working_df["total_ticket_paid"])
+    working_df["total_spend"] = (
+        working_df["merch_net_total"] + working_df["total_ticket_paid"]
+    )
     working_df["tenure_days"] = (working_df["last_game"] - working_df["first_game"]).dt.days
     working_df["tenure_days"] = working_df["tenure_days"].fillna(0.0)
     working_df["section_group"] = build_section_group(working_df["most_common_section"])
@@ -564,7 +620,8 @@ def prepare_fan_behavior_metrics(full_fan_master: pd.DataFrame) -> dict:
 # =============================================================================
 # Survey Analysis Page Metrics
 # =============================================================================
-SURVEY_METRIC_SCHEMA_VERSION = "survey_v5"
+SURVEY_METRIC_SCHEMA_VERSION = "survey_v8"
+SENTIMENT_BIN_ORDER = ["Negative", "Neutral", "Positive"]
 TOPIC_RULES = [
     (
         "Food & Beverage",
@@ -586,7 +643,7 @@ TOPIC_RULES = [
         ["mashgin", "automated checkout", "checkout", "device", "kiosk", "app"],
     ),
     (
-        "Entertainment & On-Field",
+        "Entertainment",
         ["on-field", "presentation", "music", "promotion", "promotional", "announcer", "between innings", "entertainment"],
     ),
     (
@@ -779,12 +836,23 @@ def get_sentiment_analyzer() -> SentimentIntensityAnalyzer:
     return SentimentIntensityAnalyzer()
 
 
-def sentiment_label(compound: float) -> str:
-    if compound >= 0.05:
-        return "Positive"
-    if compound <= -0.05:
+def vader_compound_to_score(compound: float) -> float:
+    return float(np.clip((float(compound) + 1.0) * 5.0, 0.0, 10.0))
+
+
+def sentiment_label_from_score(score: float) -> str:
+    if pd.isna(score):
+        return pd.NA
+    score_value = float(score)
+    if score_value <= 3.0:
         return "Negative"
+    if score_value >= 7.0:
+        return "Positive"
     return "Neutral"
+
+
+def sentiment_label(compound: float) -> str:
+    return sentiment_label_from_score(vader_compound_to_score(compound))
 
 
 def standardize_meta_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -993,13 +1061,12 @@ def build_survey_long(survey_df: pd.DataFrame) -> pd.DataFrame:
             analyzer.polarity_scores(text).get("compound", 0.0)
             for text in text_values
         ]
+        scores = [vader_compound_to_score(compound) for compound in compounds]
         long_df.loc[text_mask, "sentiment_compound"] = compounds
+        long_df.loc[text_mask, "sentiment_index"] = scores
         long_df.loc[text_mask, "sentiment_label"] = [
-            sentiment_label(compound) for compound in compounds
+            sentiment_label_from_score(score) for score in scores
         ]
-        long_df.loc[text_mask, "sentiment_index"] = (
-            long_df.loc[text_mask, "sentiment_compound"].astype(float) + 1.0
-        ) * 5.0
 
     output_columns = [
         "survey_type",
@@ -1051,63 +1118,28 @@ def survey_year_labels(series: pd.Series) -> pd.Series:
     )
 
 
-def label_survey_types(series: pd.Series) -> pd.Series:
-    return series.astype("string").map(SURVEY_TYPE_LABELS).fillna("Unknown")
-
-
 def empty_survey_metrics(source_rows: int, long_rows: int = 0) -> dict:
     return {
         "kpis": {
             "total_survey_responses": 0,
             "avg_numeric_rating": 0.0,
             "overall_sentiment_index": 0.0,
+            "average_sentiment": 0.0,
             "negative_response_rate": 0.0,
             "postgame_response_mix": 0.0,
         },
         "charts": {
-            "responses_by_team_year": empty_chart(
-                ["team", "survey_year", "survey_type", "response_count"]
+            "historical_sentiment_distribution": empty_chart(
+                ["team", "survey_year", "sentiment_label", "response_count"]
             ),
-            "rating_by_team_year": empty_chart(
-                ["team", "survey_year", "team_year", "avg_rating", "response_count"]
+            "historical_sentiment_by_category": empty_chart(
+                ["team", "survey_year", "topic", "sentiment_score", "response_count"]
             ),
-            "sentiment_by_team_year": empty_chart(
-                ["team", "survey_year", "sentiment_index", "response_count"]
+            "historical_negative_rate_by_category": empty_chart(
+                ["team", "survey_year", "topic", "negative_rate", "response_count"]
             ),
-            "topic_rating_by_year": empty_chart(
-                [
-                    "team",
-                    "survey_year",
-                    "topic",
-                    "year_topic",
-                    "avg_rating",
-                    "response_count",
-                ]
-            ),
-            "topic_sentiment_by_year": empty_chart(
-                [
-                    "team",
-                    "survey_year",
-                    "topic",
-                    "year_topic",
-                    "sentiment_index",
-                    "negative_rate",
-                    "response_count",
-                ]
-            ),
-            "negative_rate_by_topic": empty_chart(["topic", "negative_rate"]),
-            "top_opportunity_areas": empty_chart(
-                ["topic", "negative_rate", "response_count", "opportunity_score"]
-            ),
-            "topic_text_summary": empty_chart(
-                [
-                    "team",
-                    "survey_year",
-                    "topic",
-                    "sentiment_index",
-                    "negative_rate",
-                    "response_count",
-                ]
+            "average_sentiment_by_team_year": empty_chart(
+                ["team", "survey_year", "team_year", "sentiment_score", "response_count"]
             ),
         },
         "recent_postgame": {
@@ -1118,11 +1150,21 @@ def empty_survey_metrics(source_rows: int, long_rows: int = 0) -> dict:
                 "response_count": 0,
                 "avg_rating": 0.0,
                 "sentiment_index": 0.0,
+                "average_sentiment": 0.0,
                 "negative_rate": 0.0,
             },
             "topic_rating": empty_chart(["topic", "avg_rating", "response_count"]),
             "topic_sentiment": empty_chart(
                 ["topic", "sentiment_index", "negative_rate", "response_count"]
+            ),
+            "sentiment_distribution": empty_chart(
+                ["sentiment_label", "response_count"]
+            ),
+            "sentiment_by_category": empty_chart(
+                ["topic", "sentiment_score", "response_count"]
+            ),
+            "short_answer_comments": empty_chart(
+                ["topic", "question", "comment", "sentiment_label", "sentiment_index"]
             ),
             "negative_comments": empty_chart(["topic", "question", "comment"]),
             "positive_comments": empty_chart(["topic", "question", "comment"]),
@@ -1180,6 +1222,111 @@ def build_comment_examples(
     return comments[["topic", "question", "comment"]]
 
 
+def build_unified_sentiment_frame(rows: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "survey_type",
+        "team",
+        "survey_year",
+        "_source_file",
+        "_source_sheet",
+        "_response_id",
+        "timestamp",
+        "game_date",
+        "question",
+        "topic",
+        "response_text",
+        "question_kind",
+        "sentiment_source",
+        "sentiment_score",
+        "sentiment_label",
+    ]
+    if rows.empty:
+        return empty_chart(columns)
+
+    base_columns = [column for column in columns[:-3] if column in rows.columns]
+    frames = []
+
+    rating_mask = rows["question_kind"].eq("rating") & rows["value_num"].notna()
+    if rating_mask.any():
+        ratings = rows.loc[rating_mask, base_columns + ["value_num"]].copy()
+        ratings["sentiment_source"] = "Numeric Rating"
+        ratings["sentiment_score"] = (
+            pd.to_numeric(ratings["value_num"], errors="coerce").clip(0, 10)
+        )
+        ratings["sentiment_label"] = ratings["sentiment_score"].map(
+            sentiment_label_from_score
+        )
+        if "response_text" in ratings.columns:
+            ratings["response_text"] = ratings["response_text"].fillna("")
+        frames.append(ratings.drop(columns=["value_num"]))
+
+    text_mask = rows["question_kind"].eq("text") & rows["sentiment_index"].notna()
+    if text_mask.any():
+        texts = rows.loc[text_mask, base_columns + ["sentiment_index"]].copy()
+        texts["sentiment_source"] = "Short Answer"
+        texts["sentiment_score"] = (
+            pd.to_numeric(texts["sentiment_index"], errors="coerce").clip(0, 10)
+        )
+        texts["sentiment_label"] = texts["sentiment_score"].map(
+            sentiment_label_from_score
+        )
+        frames.append(texts.drop(columns=["sentiment_index"]))
+
+    if not frames:
+        return empty_chart(columns)
+
+    sentiment_rows = pd.concat(frames, ignore_index=True, sort=False)
+    sentiment_rows = sentiment_rows[sentiment_rows["sentiment_score"].notna()]
+    return sentiment_rows[columns]
+
+
+def build_sentiment_distribution(sentiment_rows: pd.DataFrame) -> pd.DataFrame:
+    columns = ["sentiment_label", "response_count"]
+    if sentiment_rows.empty:
+        return empty_chart(columns)
+
+    counts = sentiment_rows["sentiment_label"].value_counts()
+    return pd.DataFrame(
+        {
+            "sentiment_label": SENTIMENT_BIN_ORDER,
+            "response_count": [
+                int(counts.get(sentiment_label, 0))
+                for sentiment_label in SENTIMENT_BIN_ORDER
+            ],
+        }
+    )
+
+
+def build_sentiment_by_category(sentiment_rows: pd.DataFrame) -> pd.DataFrame:
+    columns = ["topic", "sentiment_score", "response_count"]
+    if sentiment_rows.empty:
+        return empty_chart(columns)
+
+    return (
+        sentiment_rows.groupby("topic", as_index=False, observed=True)
+        .agg(
+            sentiment_score=("sentiment_score", "mean"),
+            response_count=("sentiment_score", "count"),
+        )
+        .sort_values("sentiment_score", ascending=False)
+    )
+
+
+def build_short_answer_comments(text_rows: pd.DataFrame) -> pd.DataFrame:
+    columns = ["topic", "question", "comment", "sentiment_label", "sentiment_index"]
+    if text_rows.empty:
+        return empty_chart(columns)
+
+    comments = text_rows[
+        text_rows["response_text"].astype("string").str.strip().ne("")
+    ].copy()
+    if comments.empty:
+        return empty_chart(columns)
+
+    comments["comment"] = comments["response_text"].map(short_comment)
+    return comments[columns].sort_values(["topic", "sentiment_label", "question"])
+
+
 def build_recent_postgame_metrics(long_df: pd.DataFrame) -> dict:
     postgame = long_df[long_df["survey_type"].eq("postgame")].copy()
     if postgame.empty:
@@ -1230,6 +1377,7 @@ def build_recent_postgame_metrics(long_df: pd.DataFrame) -> dict:
     recent_text = recent[
         recent["question_kind"].eq("text") & recent["sentiment_index"].notna()
     ]
+    recent_sentiment = build_unified_sentiment_frame(recent)
 
     response_count = (
         int(recent_responses["_response_id"].nunique())
@@ -1242,9 +1390,14 @@ def build_recent_postgame_metrics(long_df: pd.DataFrame) -> dict:
     sentiment_index = (
         float(recent_text["sentiment_index"].mean()) if not recent_text.empty else 0.0
     )
+    average_sentiment = (
+        float(recent_sentiment["sentiment_score"].mean())
+        if not recent_sentiment.empty
+        else 0.0
+    )
     negative_rate = (
-        float(recent_text["sentiment_label"].eq("Negative").mean())
-        if not recent_text.empty
+        float(recent_sentiment["sentiment_label"].eq("Negative").mean())
+        if not recent_sentiment.empty
         else 0.0
     )
 
@@ -1281,12 +1434,16 @@ def build_recent_postgame_metrics(long_df: pd.DataFrame) -> dict:
             "response_count": response_count,
             "avg_rating": avg_rating,
             "sentiment_index": sentiment_index,
+            "average_sentiment": average_sentiment,
             "negative_rate": negative_rate,
         },
         "topic_rating": topic_rating,
         "topic_sentiment": topic_sentiment,
-        "negative_comments": build_comment_examples(recent_text, "Negative"),
-        "positive_comments": build_comment_examples(recent_text, "Positive"),
+        "sentiment_distribution": build_sentiment_distribution(recent_sentiment),
+        "sentiment_by_category": build_sentiment_by_category(recent_sentiment),
+        "short_answer_comments": build_short_answer_comments(recent_text),
+        "negative_comments": empty_chart(["topic", "question", "comment"]),
+        "positive_comments": empty_chart(["topic", "question", "comment"]),
     }
 
 
@@ -1470,46 +1627,163 @@ def build_short_answer_center(long_df: pd.DataFrame) -> dict:
     return {"options": options_df, "comments": comments}
 
 
-def build_topic_text_summary(text_chart: pd.DataFrame) -> pd.DataFrame:
+def prepare_historical_sentiment_rows(sentiment_rows: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "team",
         "survey_year",
         "topic",
-        "sentiment_index",
-        "negative_rate",
-        "response_count",
+        "sentiment_score",
+        "sentiment_label",
     ]
-    if text_chart.empty:
+    if sentiment_rows.empty:
         return empty_chart(columns)
 
-    base = text_chart.assign(
-        is_negative=text_chart["sentiment_label"].eq("Negative").astype(float)
-    )
+    historical = sentiment_rows[columns].copy()
+    historical["team"] = historical["team"].astype("string").fillna("Unknown")
+    historical["survey_year"] = survey_year_labels(historical["survey_year"])
+    historical["topic"] = historical["topic"].astype("string").fillna("Other")
+    historical["is_negative"] = historical["sentiment_label"].eq("Negative")
+    return historical
 
-    def aggregate(group_columns: list[str]) -> pd.DataFrame:
+
+def add_all_filter_levels(frame: pd.DataFrame, value_columns: list[str]) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    frames = [frame]
+    for team_columns, year_columns in [
+        ([], ["survey_year"]),
+        (["team"], []),
+        ([], []),
+    ]:
+        group_columns = team_columns + year_columns + [
+            column
+            for column in frame.columns
+            if column not in {"team", "survey_year", *value_columns}
+            and column not in team_columns
+            and column not in year_columns
+        ]
         grouped = (
-            base.groupby(group_columns, as_index=False, observed=True)
+            frame.groupby(group_columns, as_index=False, observed=True)[value_columns]
+            .sum()
+            if group_columns
+            else pd.DataFrame({column: [frame[column].sum()] for column in value_columns})
+        )
+        if "team" not in grouped.columns:
+            grouped["team"] = "All Teams"
+        if "survey_year" not in grouped.columns:
+            grouped["survey_year"] = "All Years"
+        frames.append(grouped[frame.columns])
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def build_historical_sentiment_distribution(historical: pd.DataFrame) -> pd.DataFrame:
+    columns = ["team", "survey_year", "sentiment_label", "response_count"]
+    if historical.empty:
+        return empty_chart(columns)
+
+    distribution = (
+        historical.groupby(
+            ["team", "survey_year", "sentiment_label"],
+            as_index=False,
+            observed=True,
+        )
+        .size()
+        .rename(columns={"size": "response_count"})
+    )
+    distribution = add_all_filter_levels(distribution[columns], ["response_count"])
+    keys = distribution[["team", "survey_year"]].drop_duplicates()
+    labels = pd.DataFrame({"sentiment_label": SENTIMENT_BIN_ORDER})
+    skeleton = keys.assign(_join_key=1).merge(
+        labels.assign(_join_key=1),
+        on="_join_key",
+    ).drop(columns="_join_key")
+    distribution = skeleton.merge(
+        distribution,
+        on=["team", "survey_year", "sentiment_label"],
+        how="left",
+    )
+    distribution["response_count"] = distribution["response_count"].fillna(0).astype(int)
+    return distribution.sort_values(["survey_year", "team", "sentiment_label"])
+
+
+def build_historical_sentiment_by_category(historical: pd.DataFrame) -> pd.DataFrame:
+    columns = ["team", "survey_year", "topic", "sentiment_score", "response_count"]
+    if historical.empty:
+        return empty_chart(columns)
+
+    rows = []
+    for group_columns in [
+        ["team", "survey_year", "topic"],
+        ["team", "topic"],
+        ["survey_year", "topic"],
+        ["topic"],
+    ]:
+        grouped = (
+            historical.groupby(group_columns, as_index=False, observed=True)
             .agg(
-                sentiment_index=("sentiment_index", "mean"),
-                negative_rate=("is_negative", "mean"),
-                response_count=("response_text", "count"),
+                sentiment_score=("sentiment_score", "mean"),
+                response_count=("sentiment_score", "count"),
             )
         )
         if "team" not in grouped.columns:
             grouped["team"] = "All Teams"
         if "survey_year" not in grouped.columns:
             grouped["survey_year"] = "All Years"
-        return grouped[columns]
-
-    frames = [
-        aggregate(["team", "survey_year", "topic"]),
-        aggregate(["team", "topic"]),
-        aggregate(["survey_year", "topic"]),
-        aggregate(["topic"]),
-    ]
-    return pd.concat(frames, ignore_index=True).sort_values(
-        ["survey_year", "team", "topic"]
+        rows.append(grouped[columns])
+    return pd.concat(rows, ignore_index=True).sort_values(
+        ["survey_year", "team", "sentiment_score"],
+        ascending=[True, True, False],
     )
+
+
+def build_historical_negative_rate_by_category(historical: pd.DataFrame) -> pd.DataFrame:
+    columns = ["team", "survey_year", "topic", "negative_rate", "response_count"]
+    if historical.empty:
+        return empty_chart(columns)
+
+    rows = []
+    for group_columns in [
+        ["team", "survey_year", "topic"],
+        ["team", "topic"],
+        ["survey_year", "topic"],
+        ["topic"],
+    ]:
+        grouped = (
+            historical.groupby(group_columns, as_index=False, observed=True)
+            .agg(
+                negative_rate=("is_negative", "mean"),
+                response_count=("is_negative", "count"),
+            )
+        )
+        if "team" not in grouped.columns:
+            grouped["team"] = "All Teams"
+        if "survey_year" not in grouped.columns:
+            grouped["survey_year"] = "All Years"
+        rows.append(grouped[columns])
+    return pd.concat(rows, ignore_index=True).sort_values(
+        ["survey_year", "team", "negative_rate"],
+        ascending=[True, True, False],
+    )
+
+
+def build_average_sentiment_by_team_year(historical: pd.DataFrame) -> pd.DataFrame:
+    columns = ["team", "survey_year", "team_year", "sentiment_score", "response_count"]
+    if historical.empty:
+        return empty_chart(columns)
+
+    average = (
+        historical.groupby(["team", "survey_year"], as_index=False, observed=True)
+        .agg(
+            sentiment_score=("sentiment_score", "mean"),
+            response_count=("sentiment_score", "count"),
+        )
+        .sort_values(["team", "survey_year"])
+    )
+    average["team_year"] = (
+        average["team"].astype(str) + " " + average["survey_year"].astype(str)
+    )
+    return average[columns]
 
 
 @cache_page_metrics
@@ -1526,6 +1800,7 @@ def prepare_survey_analysis_metrics(survey_frames_or_df) -> dict:
     text_rows = long_df[
         long_df["question_kind"].eq("text") & long_df["sentiment_index"].notna()
     ]
+    sentiment_rows = build_unified_sentiment_frame(long_df)
 
     total_responses = (
         int(responses["_response_id"].nunique()) if not responses.empty else 0
@@ -1536,9 +1811,14 @@ def prepare_survey_analysis_metrics(survey_frames_or_df) -> dict:
     sentiment_index = (
         float(text_rows["sentiment_index"].mean()) if not text_rows.empty else 0.0
     )
+    average_sentiment = (
+        float(sentiment_rows["sentiment_score"].mean())
+        if not sentiment_rows.empty
+        else 0.0
+    )
     negative_response_rate = (
-        float(text_rows["sentiment_label"].eq("Negative").mean())
-        if not text_rows.empty
+        float(sentiment_rows["sentiment_label"].eq("Negative").mean())
+        if not sentiment_rows.empty
         else 0.0
     )
     postgame_response_mix = (
@@ -1551,182 +1831,19 @@ def prepare_survey_analysis_metrics(survey_frames_or_df) -> dict:
     responses_chart["survey_year"] = survey_year_labels(
         responses_chart["survey_year"]
     )
-    responses_chart["survey_type"] = label_survey_types(
-        responses_chart["survey_type"]
+    historical_sentiment = prepare_historical_sentiment_rows(sentiment_rows)
+    historical_sentiment_distribution = build_historical_sentiment_distribution(
+        historical_sentiment
     )
-
-    responses_by_team_year = (
-        responses_chart.groupby(
-            ["team", "survey_year", "survey_type"],
-            as_index=False,
-            observed=True,
-        )["_response_id"]
-        .nunique()
-        .rename(columns={"_response_id": "response_count"})
-        .sort_values(["survey_year", "team", "survey_type"])
-        if not responses_chart.empty
-        else empty_chart(["team", "survey_year", "survey_type", "response_count"])
+    historical_sentiment_by_category = build_historical_sentiment_by_category(
+        historical_sentiment
     )
-
-    rating_chart = rating_rows.copy()
-    if not rating_chart.empty:
-        rating_chart["survey_year"] = survey_year_labels(rating_chart["survey_year"])
-
-    text_chart = text_rows.copy()
-    if not text_chart.empty:
-        text_chart["survey_year"] = survey_year_labels(text_chart["survey_year"])
-
-    rating_by_team_year = (
-        rating_chart.groupby(["team", "survey_year"], as_index=False, observed=True)
-        .agg(avg_rating=("value_num", "mean"), response_count=("value_num", "count"))
-        .sort_values(["survey_year", "team"])
-        if not rating_chart.empty
-        else empty_chart(
-            ["team", "survey_year", "team_year", "avg_rating", "response_count"]
-        )
+    historical_negative_rate_by_category = build_historical_negative_rate_by_category(
+        historical_sentiment
     )
-    if not rating_by_team_year.empty:
-        rating_by_team_year["team_year"] = (
-            rating_by_team_year["survey_year"].astype(str)
-            + " "
-            + rating_by_team_year["team"].astype(str)
-        )
-
-    sentiment_by_team_year = (
-        text_chart.groupby(["team", "survey_year"], as_index=False, observed=True)
-        .agg(
-            sentiment_index=("sentiment_index", "mean"),
-            response_count=("response_text", "count"),
-        )
-        .sort_values(["survey_year", "team"])
-        if not text_chart.empty
-        else empty_chart(["team", "survey_year", "sentiment_index", "response_count"])
+    average_sentiment_by_team_year = build_average_sentiment_by_team_year(
+        historical_sentiment
     )
-
-    topic_rating_by_year = (
-        rating_chart.groupby(
-            ["team", "survey_year", "topic"],
-            as_index=False,
-            observed=True,
-        )
-        .agg(avg_rating=("value_num", "mean"), response_count=("value_num", "count"))
-        .sort_values(["survey_year", "team", "topic"])
-        if not rating_chart.empty
-        else empty_chart(
-            [
-                "team",
-                "survey_year",
-                "topic",
-                "year_topic",
-                "avg_rating",
-                "response_count",
-            ]
-        )
-    )
-    if not rating_chart.empty:
-        overall_topic_rating = (
-            rating_chart.groupby(["survey_year", "topic"], as_index=False, observed=True)
-            .agg(
-                avg_rating=("value_num", "mean"),
-                response_count=("value_num", "count"),
-            )
-            .assign(team="All Teams")
-        )
-        topic_rating_by_year = pd.concat(
-            [topic_rating_by_year, overall_topic_rating],
-            ignore_index=True,
-        )
-    if not topic_rating_by_year.empty:
-        topic_rating_by_year["year_topic"] = (
-            topic_rating_by_year["survey_year"].astype(str)
-            + " "
-            + topic_rating_by_year["topic"].astype(str)
-        )
-
-    topic_sentiment_by_year = (
-        text_chart.assign(
-            is_negative=text_chart["sentiment_label"].eq("Negative").astype(float)
-        )
-        .groupby(["team", "survey_year", "topic"], as_index=False, observed=True)
-        .agg(
-            sentiment_index=("sentiment_index", "mean"),
-            negative_rate=("is_negative", "mean"),
-            response_count=("response_text", "count"),
-        )
-        .sort_values(["survey_year", "team", "topic"])
-        if not text_chart.empty
-        else empty_chart(
-            [
-                "team",
-                "survey_year",
-                "topic",
-                "year_topic",
-                "sentiment_index",
-                "negative_rate",
-                "response_count",
-            ]
-        )
-    )
-    if not text_chart.empty:
-        overall_topic_sentiment = (
-            text_chart.assign(
-                is_negative=text_chart["sentiment_label"].eq("Negative").astype(float)
-            )
-            .groupby(["survey_year", "topic"], as_index=False, observed=True)
-            .agg(
-                sentiment_index=("sentiment_index", "mean"),
-                negative_rate=("is_negative", "mean"),
-                response_count=("response_text", "count"),
-            )
-            .assign(team="All Teams")
-        )
-        topic_sentiment_by_year = pd.concat(
-            [topic_sentiment_by_year, overall_topic_sentiment],
-            ignore_index=True,
-        )
-    if not topic_sentiment_by_year.empty:
-        topic_sentiment_by_year["year_topic"] = (
-            topic_sentiment_by_year["survey_year"].astype(str)
-            + " "
-            + topic_sentiment_by_year["topic"].astype(str)
-        )
-
-    topic_text_summary = build_topic_text_summary(text_chart)
-
-    negative_rate_by_topic = (
-        text_rows.assign(
-            is_negative=text_rows["sentiment_label"].eq("Negative").astype(float)
-        )
-        .groupby("topic", as_index=False, observed=True)["is_negative"]
-        .mean()
-        .rename(columns={"is_negative": "negative_rate"})
-        .sort_values("negative_rate", ascending=False)
-        if not text_rows.empty
-        else empty_chart(["topic", "negative_rate"])
-    )
-
-    if not text_rows.empty:
-        opportunity = (
-            text_rows.assign(
-                is_negative=text_rows["sentiment_label"].eq("Negative").astype(float)
-            )
-            .groupby("topic", as_index=False, observed=True)
-            .agg(
-                negative_rate=("is_negative", "mean"),
-                response_count=("response_text", "count"),
-            )
-        )
-        opportunity["opportunity_score"] = opportunity["negative_rate"] * np.log1p(
-            opportunity["response_count"]
-        )
-        opportunity = opportunity.sort_values(
-            "opportunity_score",
-            ascending=False,
-        ).head(10)
-    else:
-        opportunity = empty_chart(
-            ["topic", "negative_rate", "response_count", "opportunity_score"]
-        )
 
     teams = sorted(
         [team for team in responses_chart["team"].dropna().astype(str).unique()]
@@ -1736,25 +1853,20 @@ def prepare_survey_analysis_metrics(survey_frames_or_df) -> dict:
     )
 
     postgame_pulses = build_postgame_pulse_collection(long_df)
-    short_answer_center = build_short_answer_center(long_df)
-
     return {
         "kpis": {
             "total_survey_responses": total_responses,
             "avg_numeric_rating": avg_numeric_rating,
             "overall_sentiment_index": sentiment_index,
+            "average_sentiment": average_sentiment,
             "negative_response_rate": negative_response_rate,
             "postgame_response_mix": postgame_response_mix,
         },
         "charts": {
-            "responses_by_team_year": responses_by_team_year,
-            "rating_by_team_year": rating_by_team_year,
-            "sentiment_by_team_year": sentiment_by_team_year,
-            "topic_rating_by_year": topic_rating_by_year,
-            "topic_sentiment_by_year": topic_sentiment_by_year,
-            "negative_rate_by_topic": negative_rate_by_topic,
-            "top_opportunity_areas": opportunity,
-            "topic_text_summary": topic_text_summary,
+            "historical_sentiment_distribution": historical_sentiment_distribution,
+            "historical_sentiment_by_category": historical_sentiment_by_category,
+            "historical_negative_rate_by_category": historical_negative_rate_by_category,
+            "average_sentiment_by_team_year": average_sentiment_by_team_year,
         },
         "recent_postgame": (
             postgame_pulses[0]
@@ -1762,7 +1874,20 @@ def prepare_survey_analysis_metrics(survey_frames_or_df) -> dict:
             else build_recent_postgame_metrics(long_df)
         ),
         "postgame_pulses": postgame_pulses,
-        "short_answer_center": short_answer_center,
+        "short_answer_center": {
+            "options": empty_chart(["event_key", "survey_label"]),
+            "comments": empty_chart(
+                [
+                    "event_key",
+                    "survey_label",
+                    "topic",
+                    "question",
+                    "comment",
+                    "sentiment_label",
+                    "sentiment_index",
+                ]
+            ),
+        },
         "metadata": {
             "built_at": time.time(),
             "source_rows": len(survey_df),

@@ -1,6 +1,7 @@
 import re
 import sys
 import time
+from html import escape
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from pages.render_components import render_metric_cards
 
 SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xlsm", ".xls", ".parquet"}
 TRANSACTION_SOURCE_COLUMNS = [
@@ -85,43 +87,228 @@ DATASET_TYPE_ALIASES = {
     "unknown_data": "unknown",
 }
 FAN_BEHAVIOR_METRIC_SCHEMA_VERSION = "fan_behavior_v6"
-TRANSACTION_METRIC_SCHEMA_VERSION = "transaction_v5"
-SURVEY_METRIC_SCHEMA_VERSION = "survey_v5"
+TRANSACTION_METRIC_SCHEMA_VERSION = "transaction_v9"
+SURVEY_METRIC_SCHEMA_VERSION = "survey_v8"
+
+APP_BRAND_TITLE = "Madison Mallards & Nightmares"
 
 
-def render_metric_card(column: Any, label: str, value: str) -> None:
-    with column.container(border=True):
-        st.markdown(
-            (
-                "<div style='"
-                "min-height:108px;"
-                "position:relative;"
-                "text-align:center;"
-                "'>"
-                "<div style='"
-                "position:absolute;"
-                "left:0;"
-                "right:0;"
-                "top:0.25rem;"
-                "font-size:19px;"
-                "color:#667085;"
-                "line-height:1.15;"
-                f"'>{label}</div>"
-                "<div style='"
-                "position:absolute;"
-                "left:0;"
-                "right:0;"
-                "top:50%;"
-                "transform:translateY(-50%);"
-                "font-size:32px;"
-                "font-weight:700;"
-                "line-height:1.1;"
-                "'>"
-                f"{value}</div>"
-                "</div>"
+def _style_block(selector: str, style: dict[str, str]) -> str:
+    rules = "\n".join(
+        f"  {key.replace('_', '-')}: {value} !important;"
+        for key, value in style.items()
+    )
+    return f"{selector} {{\n{rules}\n}}"
+
+
+def _inline_style(style: dict[str, Any]) -> str:
+    return "; ".join(
+        f"{key.replace('_', '-')}: {value}"
+        for key, value in style.items()
+        if value is not None
+    )
+
+
+def app_style_css() -> str:
+    caption_rules = {
+        "font_size": "16px",
+        "font_weight": "700",
+        "color": "#000000",
+        "font_family": "Georgia Bold",
+        "line_height": "1.35",
+    }
+    sidebar_nav_selector = (
+        '[data-testid="stSidebar"] [data-testid="stSidebarNav"] a, '
+        '[data-testid="stSidebar"] [data-testid="stSidebarNav"] button, '
+        '[data-testid="stSidebar"] nav a, '
+        '[data-testid="stSidebar"] nav button, '
+        '[data-testid="stSidebar"] [role="navigation"] a, '
+        '[data-testid="stSidebar"] [role="navigation"] button, '
+        '[data-testid="stSidebar"] [data-testid="stPageLink"] a'
+    )
+    sidebar_nav_child_selector = (
+        '[data-testid="stSidebar"] [data-testid="stSidebarNav"] a *, '
+        '[data-testid="stSidebar"] [data-testid="stSidebarNav"] button *, '
+        '[data-testid="stSidebar"] nav a *, '
+        '[data-testid="stSidebar"] nav button *, '
+        '[data-testid="stSidebar"] [role="navigation"] a *, '
+        '[data-testid="stSidebar"] [role="navigation"] button *, '
+        '[data-testid="stSidebar"] [data-testid="stPageLink"] a *'
+    )
+    sidebar_nav_hover_selector = (
+        '[data-testid="stSidebar"] [data-testid="stSidebarNav"] a:hover, '
+        '[data-testid="stSidebar"] [data-testid="stSidebarNav"] button:hover, '
+        '[data-testid="stSidebar"] nav a:hover, '
+        '[data-testid="stSidebar"] nav button:hover, '
+        '[data-testid="stSidebar"] [role="navigation"] a:hover, '
+        '[data-testid="stSidebar"] [role="navigation"] button:hover, '
+        '[data-testid="stSidebar"] [data-testid="stPageLink"] a:hover'
+    )
+    sidebar_nav_active_selector = (
+        '[data-testid="stSidebar"] [data-testid="stSidebarNav"] a[aria-current="page"], '
+        '[data-testid="stSidebar"] [data-testid="stSidebarNav"] button[aria-current="page"], '
+        '[data-testid="stSidebar"] nav a[aria-current="page"], '
+        '[data-testid="stSidebar"] nav button[aria-current="page"], '
+        '[data-testid="stSidebar"] [role="navigation"] a[aria-current="page"], '
+        '[data-testid="stSidebar"] [role="navigation"] button[aria-current="page"], '
+        '[data-testid="stSidebar"] [data-testid="stPageLink"] a[aria-current="page"], '
+        '[data-testid="stSidebar"] a[aria-selected="true"], '
+        '[data-testid="stSidebar"] button[aria-selected="true"]'
+    )
+    return "\n".join(
+        [
+            "<style>",
+            _style_block(".stApp", {"background": "#FFFFFF"}),
+            _style_block(
+                '[data-testid="stAppViewContainer"]',
+                {"background": "#FFFFFF"},
             ),
-            unsafe_allow_html=True,
-        )
+            _style_block(
+                '[data-testid="stMain"]',
+                {"background": "#FFFFFF"},
+            ),
+            _style_block(
+                '[data-testid="stSidebar"]',
+                {"background": "#AAAAAA"},
+            ),
+            _style_block(
+                sidebar_nav_selector,
+                {
+                    "font_size": "16px",
+                    "font_weight": "600",
+                    "font_family": "Georgia Bold",
+                    "color": "#000000",
+                    "text_decoration": "none",
+                },
+            ),
+            _style_block(
+                sidebar_nav_child_selector,
+                {
+                    "font_size": "16px",
+                    "font_weight": "600",
+                    "font_family": "Georgia Bold",
+                    "color": "inherit",
+                },
+            ),
+            _style_block(
+                sidebar_nav_hover_selector,
+                {
+                    "color": "#1c5b38",
+                    "background": "rgba(28, 91, 56, 0.08)",
+                },
+            ),
+            _style_block(
+                sidebar_nav_active_selector,
+                {
+                    "color": "#1c5b38",
+                    "background": "rgba(28, 91, 56, 0.10)",
+                },
+            ),
+            _style_block(
+                ".mallards-brand-title",
+                {
+                    "font_size": "42px",
+                    "font_weight": "700",
+                    "color": "#1c5b38",
+                    "font_family": "Georgia Bold",
+                    "margin_bottom": "-2rem",
+                },
+            ),
+            _style_block(
+                '[data-testid="stHeading"] h1',
+                {
+                    "font_size": "34px",
+                    "font_weight": "750",
+                    "color": "#000000",
+                    "font_family": "Georgia Bold",
+                    "line_height": "1.08",
+                    "margin_bottom": "-1rem",
+                },
+            ),
+            _style_block('[data-testid="stCaptionContainer"]', caption_rules),
+            _style_block('[data-testid="stCaptionContainer"] *', caption_rules),
+            "</style>",
+        ]
+    )
+
+
+def apply_app_styles() -> None:
+    st.markdown(app_style_css(), unsafe_allow_html=True)
+
+
+def render_app_brand() -> None:
+    apply_app_styles()
+    st.markdown(
+        f"<div class='mallards-brand-title'>{escape(APP_BRAND_TITLE)}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_page_title(title: str) -> None:
+    render_app_brand()
+    st.title(title)
+
+
+def render_header(text: str, style: dict[str, Any] | None = None) -> None:
+    header_style = style or {
+        "font_size": "30px",
+        "font_weight": "700",
+        "color": "#000000",
+        "font_family": "Georgia Bold",
+        "line_height": "1.18",
+        "margin_top": "1rem",
+        "margin_bottom": "0.45rem",
+    }
+    st.markdown(
+        f"<div style='{_inline_style(header_style)}'>{escape(text)}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_subheader(text: str, style: dict[str, Any] | None = None) -> None:
+    subheader_style = style or {
+        "font_size": "24px",
+        "font_weight": "650",
+        "color": "#000000",
+        "font_family": "Georgia Bold",
+        "line_height": "1.2",
+        "margin_top": "0.75rem",
+        "margin_bottom": "0.35rem",
+    }
+    st.markdown(
+        f"<div style='{_inline_style(subheader_style)}'>{escape(text)}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_divider(style: dict[str, Any] | None = None) -> None:
+    divider_style = style or {
+        "color": "#000000",
+        "height": "2px",
+        "padding_top": "1rem",
+        "padding_bottom": "0.5rem",
+        "margin_left": "0",
+        "margin_right": "0",
+    }
+    wrapper_style = {
+        "padding_top": divider_style["padding_top"],
+        "padding_bottom": divider_style["padding_bottom"],
+        "margin_left": divider_style["margin_left"],
+        "margin_right": divider_style["margin_right"],
+    }
+    line_style = {
+        "border": "0",
+        "border_top": f"{divider_style['height']} solid {divider_style['color']}",
+        "margin": "0",
+    }
+    st.markdown(
+        (
+            f"<div style='{_inline_style(wrapper_style)}'>"
+            f"<hr style='{_inline_style(line_style)}'>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def normalize_column_name(column: Any) -> str:
@@ -346,6 +533,30 @@ def add_source_file_column(df: pd.DataFrame, file_name: str) -> pd.DataFrame:
     return df
 
 
+def optimize_dataframe_for_session(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    row_count = len(df)
+    category_limit = min(1_000, max(1, row_count // 4))
+    for column in df.columns:
+        series = df[column]
+        if pd.api.types.is_integer_dtype(series):
+            df[column] = pd.to_numeric(series, downcast="integer")
+            continue
+        if pd.api.types.is_float_dtype(series):
+            df[column] = pd.to_numeric(series, downcast="float")
+            continue
+        if (
+            pd.api.types.is_object_dtype(series)
+            or pd.api.types.is_string_dtype(series)
+        ):
+            unique_count = series.nunique(dropna=True)
+            if 0 < unique_count <= category_limit:
+                df[column] = series.astype("category")
+    return df
+
+
 def normalize_dataset_type(dataset_type: Any) -> str:
     if dataset_type is None:
         return "unknown"
@@ -408,13 +619,14 @@ def append_dataframes_to_state(
         existing_df = st.session_state.get(state_key, pd.DataFrame())
         new_df = pd.concat(frames, ignore_index=True, sort=False)
         if existing_df.empty:
-            st.session_state[state_key] = new_df
+            st.session_state[state_key] = optimize_dataframe_for_session(new_df)
         else:
-            st.session_state[state_key] = pd.concat(
+            combined_df = pd.concat(
                 [existing_df, new_df],
                 ignore_index=True,
                 sort=False,
             )
+            st.session_state[state_key] = optimize_dataframe_for_session(combined_df)
 
 
 def remove_source_file_from_state(file_name: str) -> None:
@@ -422,9 +634,10 @@ def remove_source_file_from_state(file_name: str) -> None:
         df = st.session_state.get(state_key, pd.DataFrame())
         if df.empty or SOURCE_FILE_COLUMN not in df.columns:
             continue
-        st.session_state[state_key] = df[
+        filtered_df = df[
             ~df[SOURCE_FILE_COLUMN].astype("string").eq(file_name)
         ].reset_index(drop=True)
+        st.session_state[state_key] = optimize_dataframe_for_session(filtered_df)
 
 
 def to_numeric_preserve_index(series: pd.Series) -> pd.Series:
@@ -880,11 +1093,12 @@ def migrate_legacy_session_storage() -> None:
         if not state_key or not frames:
             continue
         if st.session_state.get(state_key, pd.DataFrame()).empty:
-            st.session_state[state_key] = pd.concat(
+            migrated_df = pd.concat(
                 frames,
                 ignore_index=True,
                 sort=False,
             )
+            st.session_state[state_key] = optimize_dataframe_for_session(migrated_df)
 
     st.session_state.loaded_dataset_records = normalized_records
     st.session_state.loaded_files = {
@@ -897,14 +1111,6 @@ def migrate_legacy_session_storage() -> None:
 
 
 def initialize_session_state() -> None:
-    if "transaction_data" not in st.session_state:
-        st.session_state.transaction_data = []
-    if "ticket_data" not in st.session_state:
-        st.session_state.ticket_data = []
-    if "survey_data" not in st.session_state:
-        st.session_state.survey_data = []
-    if "unknown_data" not in st.session_state:
-        st.session_state.unknown_data = []
     if "loaded_files" not in st.session_state:
         st.session_state.loaded_files = set()
     if "last_upload_batch" not in st.session_state:
@@ -1308,12 +1514,18 @@ def process_uploaded_files(uploaded_files: list[Any]) -> bool:
         elif detected_type == "survey_data":
             invalidate_survey_metrics()
 
+        loaded_rows = len(loaded_data)
+        loaded_columns = len(loaded_data.columns)
+        if detected_type == "unknown":
+            loaded_data = pd.DataFrame({SOURCE_FILE_COLUMN: [file_name] * loaded_rows})
+
+        optimize_dataframe_for_session(loaded_data)
         loaded_dataframes_by_type.setdefault(detected_type, []).append(loaded_data)
         add_loaded_dataset_record(
             file_name,
             detected_type,
-            len(loaded_data),
-            len(loaded_data.columns),
+            loaded_rows,
+            loaded_columns,
         )
         loaded_any_file = True
         detection_label = DATA_TYPE_LABELS.get(detected_type, "Unknown")
@@ -1367,6 +1579,7 @@ def build_fan_master_from_session() -> None:
     )
     match_rate = matched_rows / total_rows if total_rows else 0
 
+    optimize_dataframe_for_session(fan_master)
     st.session_state.full_fan_master = fan_master
     st.session_state.fan_master_rows = total_rows
     st.session_state.fan_master_match_rate = f"{match_rate:.2%}"
@@ -1376,9 +1589,8 @@ def build_fan_master_from_session() -> None:
 
 
 def render_upload_section() -> None:
-    st.header("Upload Data")
     uploaded_files = st.file_uploader(
-        "Upload datasets",
+        "Upload datasets:",
         type=["csv", "xlsx", "xlsm", "xls", "parquet"],
         accept_multiple_files=True,
         key=f"dataset_uploader_{st.session_state.upload_widget_version}",
@@ -1460,10 +1672,50 @@ def render_summary_section() -> None:
         ),
         ("Unknown", loaded_file_count("unknown"), len(st.session_state.unknown_df)),
     ]
-    columns = st.columns(4)
-    for column, (label, file_count, row_count) in zip(columns, summary_items):
-        column.metric(f"{label} files", f"{file_count:,}")
-        column.caption(f"{row_count:,} rows detected")
+    render_metric_cards(
+        [
+            {
+                "label": f"{label} files",
+                "value": f"{file_count:,}",
+                "card_style": {
+                    "min_height": "70px",
+                    "padding": "0.4rem 0.4rem",
+                    "border": "3px solid rgba(49, 51, 63, 0.2)",
+                    "border_radius": "8px",
+                    "background": "#ffffff",
+                    "position": "relative",
+                    "text_align": "center",
+                    "font_family": "Georgia Bold",
+                    "box_sizing": "border-box",
+                    "margin_bottom": "0.5rem",
+                },
+                "label_style": {
+                    "font_size": "19px",
+                    "font_weight": "600",
+                    "color": "#000000",
+                    "line_height": "1",
+                    "position": "absolute",
+                    "left": "0.45rem",
+                    "right": "0.45rem",
+                    "top": "0.3rem",
+                },
+                "value_style": {
+                    "font_size": "32px",
+                    "font_weight": "700",
+                    "color": "#000000",
+                    "line_height": "1.1",
+                    "position": "absolute",
+                    "left": "0.45rem",
+                    "right": "0.45rem",
+                    "top": "50%",
+                    "transform": "translateY(-25%)",
+                    "white_space": "normal",
+                },
+            }
+            for label, file_count, row_count in summary_items
+        ],
+        st.columns(4),
+    )
 
 
 def build_dashboard_from_session() -> list[str]:
@@ -1529,7 +1781,7 @@ def render_fan_master_section() -> None:
 def render_dashboard_page() -> None:
     initialize_session_state()
 
-    st.title("Data Ingestion")
+    render_page_title("Data Ingestion")
     render_upload_section()
     render_fan_master_section()
 
